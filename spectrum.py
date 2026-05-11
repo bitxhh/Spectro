@@ -1,0 +1,587 @@
+"""
+spectrolib.spectrum
+===================
+Класс Spectrum с fluent-интерфейсом (метод-чейнинг).
+
+Ключевые инварианты:
+
+1. Внутренние величины — на сетке длин волн (нм). OD аддитивна
+   по молекулам, поэтому она и хранится как «рабочая» величина.
+
+2. Чистая истина и шум разделены:
+       _clean_optical_depth — всё, что добавлено до шума (молекулы +
+                              ILS + дрейф базовой линии в OD-простр.)
+       _noise_T            — шумовая добавка в transmittance
+       _noise_OD            — шумовая добавка в OD (дрейф)
+   Свойство `optical_depth` собирает всё вместе.
+   Свойство `true_optical_depth` возвращает только идеал (без шума и дрейфа).
+   Это критично для эксперимента 1 диплома (RMSE препроцессинга против истины).
+
+3. Метаданные обновляются на каждом шаге (molecules, history, noise, ils).
+   Этого достаточно для воспроизведения спектра по seed.
+
+Пример:
+
+    spec = (Spectrum.from_range(750, 770, step_nm=0.001)
+            .add_molecule('O2', c_ppm=210000, L_cm=10, T_K=296, p_atm=1)
+            .add_molecule('H2O', c_ppm=10000, L_cm=10)
+            .convolve_ils(GaussILS(fwhm=1.0))
+            .add_noise_model(NoiseModel(thermal_sigma=0.005,
+                                        shot_n_photons_max=1e4),
+                             seed=42))
+
+    plt.plot(spec.wavelength_nm, spec.transmittance, label='наблюдаемое')
+    plt.plot(spec.wavelength_nm, spec.true_transmittance, label='истина')
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import hapi
+
+from .physics import nm_to_wavenumber, wavenumber_to_nm, beer_lambert
+from .hitran import fetch_molecule, init_db
+from .ils import ILS, GaussILS, gauss_convolve  # noqa: F401  (gauss_convolve для обратной совместимости)
+from .noise import NoiseModel
+
+
+class Spectrum:
+    """
+    Спектр на равномерной сетке длин волн.
+
+    Внутренние массивы:
+        wavelength_nm        — сетка (нм), монотонно возрастает
+        wavenumber_cm        — та же сетка в см⁻¹ (монотонно убывает)
+        _clean_optical_depth — OD без шума
+        _noise_T             — аддитивная добавка к transmittance
+        _noise_OD            — аддитивная добавка к OD (дрейф)
+
+    Метаданные:
+        molecules : list[dict]
+        ils       : dict | None
+        noise     : dict | None
+        history   : list[str]
+        meta      : dict (произвольное)
+
+    Семантика fluent: методы модифицируют объект и возвращают self.
+    Для ветвлений — .copy().
+    """
+
+    # -----------------------------------------------------------------
+    # Создание
+    # -----------------------------------------------------------------
+
+    def __init__(self, wavelength_nm, optical_depth=None):
+        wl = np.asarray(wavelength_nm, dtype=float)
+        if not np.all(np.diff(wl) > 0):
+            raise ValueError("wavelength_nm должна монотонно возрастать")
+        self.wavelength_nm = wl
+        self.wavenumber_cm = nm_to_wavenumber(wl)
+
+        if optical_depth is None:
+            self._clean_optical_depth = np.zeros_like(wl)
+        else:
+            self._clean_optical_depth = np.asarray(optical_depth, dtype=float)
+
+        self._noise_T = np.zeros_like(wl)
+        self._noise_OD = np.zeros_like(wl)
+
+        self.molecules = []
+        self.ils = None
+        self.noise = None
+        self.history = []
+        self.meta = {}
+
+    @classmethod
+    def from_range(cls, wl_min_nm, wl_max_nm, step_nm=None, n_points=None):
+        """
+        Пустой спектр на равномерной сетке.
+
+        Используй ровно один из: step_nm, n_points.
+
+        Внимание (вариант со step_nm): внутри используется np.arange
+        с плавающим шагом. Если (wl_max−wl_min) не кратно step_nm,
+        правая граница может слегка «прыгать» из-за ошибок округления
+        (число точек ±1 относительно ожидаемого). Если важна точная длина
+        и попадание в обе границы — используй n_points.
+        """
+        if (step_nm is None) == (n_points is None):
+            raise ValueError("Задай ровно один из: step_nm или n_points")
+        if step_nm is not None:
+            wl = np.arange(wl_min_nm, wl_max_nm + step_nm / 2, step_nm)
+        else:
+            wl = np.linspace(wl_min_nm, wl_max_nm, n_points)
+        spec = cls(wl)
+        spec.history.append(
+            f"from_range({wl_min_nm}, {wl_max_nm}, "
+            f"{'step_nm=' + str(step_nm) if step_nm else 'n_points=' + str(n_points)})"
+        )
+        return spec
+
+    def copy(self):
+        """Глубокая копия (для веток вычислений)."""
+        new = Spectrum(self.wavelength_nm.copy(),
+                       self._clean_optical_depth.copy())
+        new._noise_T = self._noise_T.copy()
+        new._noise_OD = self._noise_OD.copy()
+        new.molecules = [dict(m) for m in self.molecules]
+        new.ils = dict(self.ils) if self.ils else None
+        new.noise = dict(self.noise) if self.noise else None
+        new.history = list(self.history)
+        new.meta = dict(self.meta)
+        return new
+
+    # -----------------------------------------------------------------
+    # Свойства: разные представления
+    # -----------------------------------------------------------------
+
+    @property
+    def optical_depth(self):
+        """OD = чистая_OD + шум_OD − ln(1 + шум_T / T_чистое)."""
+        # Чистое пропускание
+        T_clean = np.exp(-self._clean_optical_depth)
+        # Зашумлённое пропускание (с защитой от <=0)
+        T_noisy = np.clip(T_clean + self._noise_T, 1e-12, None)
+        return -np.log(T_noisy) + self._noise_OD
+
+    @property
+    def transmittance(self):
+        """Наблюдаемое пропускание (с шумом)."""
+        return np.exp(-self.optical_depth)
+
+    @property
+    def absorbance(self):
+        """A = OD / ln(10) (наблюдаемая, с шумом)."""
+        return self.optical_depth / np.log(10)
+
+    @property
+    def true_optical_depth(self):
+        """Чистая OD без шума и дрейфа — для оценки качества препроцессинга."""
+        return self._clean_optical_depth.copy()
+
+    @property
+    def true_transmittance(self):
+        """Чистое пропускание без шума."""
+        return np.exp(-self._clean_optical_depth)
+
+    @property
+    def true_absorbance(self):
+        """Чистая absorbance без шума."""
+        return self._clean_optical_depth / np.log(10)
+
+    # -----------------------------------------------------------------
+    # Метаданные
+    # -----------------------------------------------------------------
+
+    @property
+    def metadata(self):
+        """
+        Полный словарь метаданных спектра — для сохранения вместе
+        с массивами и для воспроизводимости.
+
+        Внимание: поле 'step_nm' — это np.mean(np.diff(wavelength_nm)).
+        Конструктор Spectrum проверяет монотонность, но НЕ равномерность
+        сетки; для неравномерных сеток это значение становится
+        средним шагом и может ввести в заблуждение. Если ты собрал
+        спектр на нестандартной сетке — смотри сами массивы, а не это поле.
+        """
+        return {
+            'wavelength_range_nm': (float(self.wavelength_nm[0]),
+                                     float(self.wavelength_nm[-1])),
+            'n_points': len(self.wavelength_nm),
+            'step_nm': float(np.mean(np.diff(self.wavelength_nm))),
+            'molecules': [dict(m) for m in self.molecules],
+            'ils': dict(self.ils) if self.ils else None,
+            'noise': dict(self.noise) if self.noise else None,
+            'history': list(self.history),
+            'user_meta': dict(self.meta),
+        }
+
+    # -----------------------------------------------------------------
+    # Добавление молекулярного поглощения
+    # -----------------------------------------------------------------
+
+    def add_molecule(self, name, c_ppm, L_cm,
+                     T_K=296, p_atm=1.0,
+                     table_name=None, profile='voigt',
+                     wing_cm=10.0, diluent=None,
+                     step_cm=None,
+                     verbose=False):
+        """
+        Добавляет вклад молекулы в чистую OD спектра.
+
+        Использует HITRAN/hapi для расчёта коэффициента поглощения
+        на тонкой сетке, затем линейно интерполирует на сетку спектра.
+
+        Parameters
+        ----------
+        name : str
+            Имя молекулы ('O2', 'CO2', 'H2O', ...). См. MOLECULE_IDS.
+        c_ppm : float
+            Концентрация в ppm.
+        L_cm : float
+            Длина пути, см.
+        T_K, p_atm : float
+            Температура и давление.
+        table_name : str, optional
+            Имя локальной HITRAN-таблицы. Если None — fetch_molecule
+            подберёт автоматически по диапазону.
+        profile : {'voigt', 'lorentz', 'gauss'}
+            Профиль линии. Voigt — универсальный.
+        wing_cm : float
+            Запас по краям при расчёте, см⁻¹.
+        diluent : dict, optional
+            Состав уширяющей среды для hapi, например
+            {'air': 0.96, 'self': 0.04} для CO₂ в выдохе.
+            По умолчанию {'air': 1.0} (тонкая концентрация в воздухе).
+        step_cm : float, optional
+            Явный шаг сетки hapi для расчёта линий, см⁻¹.
+            Если None — выбирается автоматически по сетке спектра
+            и зажимается в диапазон [0.001, 0.01] см⁻¹
+            (нижний порог = предел точности HITRAN, верхний — чтобы hapi
+            не ругался «Big wavenumber step» на узких линиях).
+            Для сверхвысокого разрешения нужно передать step_cm
+            явно — авторасчёт его не уменьшит ниже 0.001 см⁻¹.
+        """
+        init_db()
+        wl_min = float(self.wavelength_nm.min())
+        wl_max = float(self.wavelength_nm.max())
+
+        if table_name is None:
+            table_name = fetch_molecule(name,
+                                         wl_min_nm=wl_min,
+                                         wl_max_nm=wl_max)
+
+        nu_min = nm_to_wavenumber(wl_max)   # меньшее ν
+        nu_max = nm_to_wavenumber(wl_min)   # большее ν
+
+        # Шаг сетки hapi для расчёта линий.
+        # Дефолтный выбор: min(d_nu_native/5, 0.01 см⁻¹).
+        # 0.01 см⁻¹ — потолок, чтобы не получать "Big wavenumber step"
+        # от hapi на типичных ширинах линий 0.05-0.1 см⁻¹.
+        # 0.001 см⁻¹ — пол, ниже не имеет смысла (точность HITRAN).
+        # Можно явно задать параметром step_cm.
+        if step_cm is None:
+            d_nu_native = float(np.abs(np.mean(np.diff(self.wavenumber_cm))))
+            step_cm_use = max(0.001, min(0.01, d_nu_native / 5))
+        else:
+            step_cm_use = float(step_cm)
+
+        profile_func = {
+            'voigt':   hapi.absorptionCoefficient_Voigt,
+            'lorentz': hapi.absorptionCoefficient_Lorentz,
+            'gauss':   hapi.absorptionCoefficient_Doppler,
+        }[profile]
+
+        if diluent is None:
+            diluent = {'air': 1.0}
+
+        # HITRAN_units=True → σ в см²/молекула (фундаментальная
+        # характеристика молекулы, не зависит от концентрации).
+        # Diluent влияет только на форму линии (столкновительное уширение).
+        # verbose=False подавляет диагностический вывод hapi.
+        import io as _io
+        import contextlib as _ctx
+        _sink = _io.StringIO() if not verbose else None
+        _ctx_mgr = _ctx.redirect_stdout(_sink) if not verbose else _ctx.nullcontext()
+        with _ctx_mgr:
+            nu_grid, sigma = profile_func(
+                SourceTables=table_name,
+                Environment={'T': T_K, 'p': p_atm},
+                WavenumberRange=[nu_min, nu_max],
+                WavenumberStep=step_cm_use,
+                WavenumberWing=wing_cm,
+                Diluent=diluent,
+                HITRAN_units=True,
+            )
+
+        # OD = σ · N_target · L,  N_target = (c_ppm·1e-6) · N_total(T, p)
+        od_native = beer_lambert(sigma, c_ppm=c_ppm, L_cm=L_cm,
+                                  T_K=T_K, p_atm=p_atm)
+
+        # Интерполяция на сетку спектра
+        od_on_our_grid = np.interp(
+            self.wavenumber_cm[::-1], nu_grid, od_native
+        )[::-1]
+
+        self._clean_optical_depth = self._clean_optical_depth + od_on_our_grid
+
+        self.molecules.append({
+            'name': name, 'c_ppm': c_ppm, 'L_cm': L_cm,
+            'T_K': T_K, 'p_atm': p_atm, 'profile': profile,
+            'table_name': table_name, 'diluent': dict(diluent),
+        })
+        self.history.append(
+            f"add_molecule({name}, c={c_ppm} ppm, L={L_cm} cm, "
+            f"T={T_K} K, p={p_atm} atm, profile={profile})"
+        )
+        return self
+
+    # -----------------------------------------------------------------
+    # Аппаратная функция
+    # -----------------------------------------------------------------
+
+    def convolve_ils(self, ils):
+        """
+        Свёртка с произвольной ILS (Gauss / Lorentz / Voigt / FromFile).
+
+        Применяется к **чистой** OD (до шума). Это правильный порядок:
+        ILS — характеристика прибора, она действует на физический
+        спектр перед тем, как сигнал попадёт на детектор и наберёт шум.
+
+        Parameters
+        ----------
+        ils : ILS
+            Объект ILS (см. spectrolib.ils).
+        """
+        if not isinstance(ils, ILS):
+            raise TypeError(f"Ожидался объект ILS, получено {type(ils)}")
+        self._clean_optical_depth = ils.convolve(
+            self._clean_optical_depth, self.wavelength_nm
+        )
+        self.ils = {'type': type(ils).__name__, 'repr': repr(ils),
+                    'fwhm': float(ils.fwhm)}
+        self.history.append(f"convolve_ils({ils!r})")
+        return self
+
+    def convolve_gauss(self, fwhm_nm):
+        """
+        Свёртка с гауссовой ILS — шорткат для частого случая.
+        Эквивалент: convolve_ils(GaussILS(fwhm_nm)).
+        """
+        return self.convolve_ils(GaussILS(fwhm_nm))
+
+    # -----------------------------------------------------------------
+    # Шумы
+    # -----------------------------------------------------------------
+
+    def add_noise_model(self, model: NoiseModel, seed=None):
+        """
+        Применить полную модель шума (NoiseModel из spectrolib.noise).
+
+        Шум **добавляется** к существующему (если уже был добавлен через
+        предыдущий вызов — добавки суммируются). Это полезно для проверки
+        робастности препроцессинга к разным режимам шума, но если тебе
+        нужен «чистый» режим — вызови .reset_noise() перед этим.
+
+        Parameters
+        ----------
+        model : NoiseModel
+        seed : int, optional
+            Для воспроизводимости.
+        """
+        rng = np.random.default_rng(seed)
+        T_clean = self.true_transmittance
+        delta_T, delta_OD, contributions = model.apply(
+            T_clean, self.wavelength_nm, rng
+        )
+        self._noise_T = self._noise_T + delta_T
+        self._noise_OD = self._noise_OD + delta_OD
+
+        self.noise = model.to_dict()
+        self.noise['seed'] = seed
+        self.history.append(
+            f"add_noise_model({model!r}, seed={seed})"
+        )
+        return self
+
+    def add_noise(self, snr=None, sigma=None, kind='gauss', seed=None):
+        """
+        Простой гауссов шум — обёртка над add_noise_model.
+        Сохранена для обратной совместимости.
+
+        Parameters
+        ----------
+        snr : float, optional
+            Signal-to-noise. σ = 1/snr (относительно T=1).
+        sigma : float, optional
+            СКО шума напрямую.
+        """
+        if (snr is None) == (sigma is None):
+            raise ValueError("Задай ровно один из: snr или sigma")
+        if sigma is None:
+            sigma = 1.0 / snr
+        if kind != 'gauss':
+            raise ValueError(
+                f"add_noise поддерживает только kind='gauss'. "
+                f"Для других видов используй add_noise_model."
+            )
+        return self.add_noise_model(NoiseModel(thermal_sigma=sigma), seed=seed)
+
+    def reset_noise(self):
+        """Обнулить шумовые добавки, сохранив чистую OD."""
+        self._noise_T = np.zeros_like(self.wavelength_nm)
+        self._noise_OD = np.zeros_like(self.wavelength_nm)
+        self.noise = None
+        self.history.append("reset_noise()")
+        return self
+
+    # -----------------------------------------------------------------
+    # Полиномиальный дрейф (отдельно от NoiseModel — для совместимости
+    # и потому что иногда нужен детерминированный наклон)
+    # -----------------------------------------------------------------
+
+    def add_baseline(self, slope=0.0, offset=0.0, curvature=0.0):
+        """
+        Детерминированный полиномиальный дрейф базовой линии в OD.
+
+        baseline(λ) = offset + slope·(λ−λ₀) + curvature·(λ−λ₀)²,
+        где λ₀ — центр диапазона.
+
+        В отличие от NoiseModel.drift_amplitude (который случайный),
+        этот дрейф детерминированный и идёт в **чистую** OD — то есть
+        считается частью «истинной» картины (например, известный наклон
+        отклика прибора).
+        """
+        wl0 = (self.wavelength_nm[0] + self.wavelength_nm[-1]) / 2
+        dx = self.wavelength_nm - wl0
+        baseline = offset + slope * dx + curvature * dx ** 2
+        self._clean_optical_depth = self._clean_optical_depth + baseline
+        self.history.append(
+            f"add_baseline(slope={slope}, offset={offset}, curvature={curvature})"
+        )
+        return self
+
+    # -----------------------------------------------------------------
+    # Тестовые / отладочные пики
+    # -----------------------------------------------------------------
+
+    def add_gauss_peak(self, center_nm, fwhm_nm, amplitude,
+                       in_what='optical_depth'):
+        """
+        Добавить аналитический гауссов пик. Полезно для тестов и
+        проверки ILS на известном профиле.
+
+        Идёт в чистую OD (или в чистое T → пересчёт в OD).
+        """
+        sigma = fwhm_nm / (2 * np.sqrt(2 * np.log(2)))
+        g = amplitude * np.exp(
+            -(self.wavelength_nm - center_nm) ** 2 / (2 * sigma ** 2)
+        )
+        if in_what == 'optical_depth':
+            self._clean_optical_depth = self._clean_optical_depth + g
+        elif in_what == 'transmittance':
+            T_old = self.true_transmittance
+            T_new = np.clip(T_old + g, 1e-12, None)
+            self._clean_optical_depth = -np.log(T_new)
+        else:
+            raise ValueError(
+                f"in_what должен быть 'optical_depth' или 'transmittance', "
+                f"получено {in_what!r}"
+            )
+        self.history.append(
+            f"add_gauss_peak(center_nm={center_nm}, fwhm_nm={fwhm_nm}, "
+            f"amplitude={amplitude}, in_what={in_what!r})"
+        )
+        return self
+
+    # -----------------------------------------------------------------
+    # Утилиты
+    # -----------------------------------------------------------------
+
+    def reset(self):
+        """
+        Сброс OD/шумов и связанных метаданных молекул, ILS и шума.
+
+        Что обнуляется:
+            _clean_optical_depth, _noise_T, _noise_OD, molecules, ils, noise.
+
+        Что **не** обнуляется (сохраняется как есть):
+            - wavelength_nm / wavenumber_cm (сетка)
+            - history — в неё дописывается строка "reset()", прошлые
+              записи сохраняются (журнал операций, а не текущее состояние)
+            - meta — произвольный пользовательский словарь
+
+        Если нужен полностью «голый» спектр, проще создать новый через
+        Spectrum.from_range(...).
+        """
+        self._clean_optical_depth = np.zeros_like(self.wavelength_nm)
+        self._noise_T = np.zeros_like(self.wavelength_nm)
+        self._noise_OD = np.zeros_like(self.wavelength_nm)
+        self.molecules = []
+        self.ils = None
+        self.noise = None
+        self.history.append("reset()")
+        return self
+
+    # -----------------------------------------------------------------
+    # Многоканальная регистрация
+    # -----------------------------------------------------------------
+
+    def to_channels(self, channels):
+        """
+        Имитация регистрации спектра прибором с дискретными каналами.
+
+        Возвращает ChannelizedSpectrum: массив значений по каналам
+        (вместо тысяч точек тонкой сетки — N интегралов по полосам
+        каналов прибора).
+
+        Parameters
+        ----------
+        channels : ChannelSet
+            Набор каналов прибора (см. spectrolib.channels.ChannelSet).
+
+        Returns
+        -------
+        ChannelizedSpectrum
+
+        Notes
+        -----
+        Это и есть «как видит твой реальный прибор с OLED/QD-пикселями»,
+        в отличие от тонкой сетки, имитирующей FTIR высокого разрешения.
+        Используй этот шаг последним в пайплайне (после ILS и шума).
+        """
+        from .channels import channelize
+        return channelize(self, channels)
+
+    # -----------------------------------------------------------------
+    # Визуализация
+    # -----------------------------------------------------------------
+
+    def plot(self, kind='transmittance', which='auto', ax=None,
+             figsize=None, title=None, show_legend=True, **kwargs):
+        """
+        Построить график спектра одной командой.
+
+        Parameters
+        ----------
+        kind : {'transmittance', 'absorbance', 'optical_depth'}
+        which : {'auto', 'observed', 'true', 'compare'}
+            'auto' (дефолт): если есть шум — рисует обе кривые
+            (истина пунктиром, наблюдаемое сплошным), иначе только истину.
+        ax : matplotlib.axes.Axes, optional
+        figsize : tuple, optional
+        title : str, optional
+            Если None — собирается автоматически из метаданных
+            (молекулы, T, p, L).
+        **kwargs : передаются в matplotlib для основной линии.
+
+        Returns
+        -------
+        (fig, ax)
+        """
+        from .plotting import plot_spectrum
+        return plot_spectrum(self, kind=kind, which=which, ax=ax,
+                              figsize=figsize, title=title,
+                              show_legend=show_legend, **kwargs)
+
+    def plot_clean_vs_noisy(self, kind='transmittance', figsize=None):
+        """
+        Двухпанельный график: сверху — истина и наблюдаемое,
+        снизу — разница (с RMS-аннотацией).
+
+        Полезно для оценки шума и эталонной величины RMSE препроцессинга.
+        """
+        from .plotting import plot_clean_vs_noisy
+        return plot_clean_vs_noisy(self, kind=kind, figsize=figsize)
+
+    def __repr__(self):
+        wl0, wl1 = self.wavelength_nm[0], self.wavelength_nm[-1]
+        n = len(self.wavelength_nm)
+        mols = ', '.join(m['name'] for m in self.molecules) or '-'
+        od_max = self._clean_optical_depth.max()
+        ils = self.ils['type'] if self.ils else '-'
+        noise = 'yes' if self.noise else 'no'
+        return (f"Spectrum({wl0:.1f}–{wl1:.1f} нм, {n} точек, "
+                f"молекулы: {mols}, OD_max={od_max:.4g}, "
+                f"ILS={ils}, noise={noise})")

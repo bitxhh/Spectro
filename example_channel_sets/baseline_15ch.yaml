@@ -1,0 +1,30 @@
+# Пример набора каналов для прибора на квантовых точках.
+# 15 каналов в диапазоне 750-790 нм с FWHM 25 нм каждый.
+# FWHM 25 нм — типично для CdSe/ZnS квантовых точек в видимой области.
+#
+# Этот файл — baseline-конфигурация. После решения оптимизационной
+# задачи (эксперимент 5 диплома) центры и ширины будут другими.
+
+name: "Baseline 15-канальный QD-набор 750-790 нм"
+reference: "Baseline для экспериментов перед оптимизацией"
+notes: >
+  Линейно равномерное распределение центров с FWHM 25 нм.
+  Соседние каналы перекрываются примерно на половину FWHM —
+  это даёт избыточность для согласованного фильтра.
+
+channels:
+  - {center_nm: 750.0, fwhm_nm: 25.0, shape: gauss, name: ch_00}
+  - {center_nm: 752.86, fwhm_nm: 25.0, shape: gauss, name: ch_01}
+  - {center_nm: 755.71, fwhm_nm: 25.0, shape: gauss, name: ch_02}
+  - {center_nm: 758.57, fwhm_nm: 25.0, shape: gauss, name: ch_03}
+  - {center_nm: 761.43, fwhm_nm: 25.0, shape: gauss, name: ch_04}
+  - {center_nm: 764.29, fwhm_nm: 25.0, shape: gauss, name: ch_05}
+  - {center_nm: 767.14, fwhm_nm: 25.0, shape: gauss, name: ch_06}
+  - {center_nm: 770.0,  fwhm_nm: 25.0, shape: gauss, name: ch_07}
+  - {center_nm: 772.86, fwhm_nm: 25.0, shape: gauss, name: ch_08}
+  - {center_nm: 775.71, fwhm_nm: 25.0, shape: gauss, name: ch_09}
+  - {center_nm: 778.57, fwhm_nm: 25.0, shape: gauss, name: ch_10}
+  - {center_nm: 781.43, fwhm_nm: 25.0, shape: gauss, name: ch_11}
+  - {center_nm: 784.29, fwhm_nm: 25.0, shape: gauss, name: ch_12}
+  - {center_nm: 787.14, fwhm_nm: 25.0, shape: gauss, name: ch_13}
+  - {center_nm: 790.0,  fwhm_nm: 25.0, shape: gauss, name: ch_14}
