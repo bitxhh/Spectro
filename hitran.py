@@ -17,6 +17,8 @@ spectrolib.hitran
 """
 
 import os
+import shutil
+
 import hapi
 
 
@@ -119,3 +121,52 @@ def list_local_tables():
     """Возвращает список локально доступных таблиц HITRAN."""
     init_db()
     return list(hapi.tableList())
+
+
+def clear_cache(table=None, db_path='hitran_data'):
+    """
+    Удалить локальные таблицы HITRAN.
+
+    Parameters
+    ----------
+    table : str | None
+        Если задано — удалить только эту таблицу (файлы `.data` + `.header`
+        и in-memory запись в hapi.LOCAL_TABLE_CACHE).
+        Если None — снести весь кеш (всю папку db_path и сбросить in-memory).
+    db_path : str
+        Путь к папке кеша. По умолчанию 'hitran_data' (как в init_db).
+
+    Returns
+    -------
+    list[str]
+        Имена удалённых таблиц.
+
+    Examples
+    --------
+    >>> clear_cache('O2_759-775nm')           # одна таблица
+    >>> clear_cache()                         # весь кеш
+    """
+    global _DB_INITIALIZED
+    cache = getattr(hapi, 'LOCAL_TABLE_CACHE', None)
+    removed = []
+
+    if table is not None:
+        for ext in ('.data', '.header'):
+            p = os.path.join(db_path, table + ext)
+            if os.path.exists(p):
+                os.remove(p)
+        if cache is not None and table in cache:
+            del cache[table]
+        removed.append(table)
+        return removed
+
+    # Полная очистка
+    if os.path.exists(db_path):
+        for fname in os.listdir(db_path):
+            if fname.endswith('.data'):
+                removed.append(fname[:-len('.data')])
+        shutil.rmtree(db_path)
+    if cache is not None:
+        cache.clear()
+    _DB_INITIALIZED = False
+    return removed

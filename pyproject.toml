@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectrolib"
+version = "0.7.0"
+description = "Синтез и обработка абсорбционных спектров газовых смесей (HITRAN, ILS, шумы, биомаркерные панели, многоканальная регистрация)."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "Banshiev"}]
+license = {text = "MIT"}
+keywords = ["spectroscopy", "HITRAN", "absorption", "gas-analysis", "biomarkers"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "matplotlib",
+    "pyyaml",
+    "hitran-api",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+excel = ["openpyxl"]
+
+# --- Layout note ---
+# В этом репо файлы пакета лежат в корне (рядом с pyproject.toml), а не в
+# поддиректории `spectrolib/`. package-dir = {"spectrolib" = "."} говорит
+# setuptools: «папка . — это содержимое пакета spectrolib».
+[tool.setuptools]
+packages = ["spectrolib"]
+
+[tool.setuptools.package-dir]
+spectrolib = "."
+
+[tool.setuptools.package-data]
+spectrolib = [
+    "example_panels/*.yaml",
+    "example_panels/*.json",
+    "example_channel_sets/*.yaml",
+    "example_channel_sets/*.json",
+]
+
+[tool.setuptools.exclude-package-data]
+spectrolib = [
+    "tests/*",
+    ".claude/*",
+    ".git/*",
+    "hitran_data/*",
+    "*.md",
+    "NOTES.md",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

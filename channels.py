@@ -435,8 +435,7 @@ class ChannelizedSpectrum:
         which: 'auto' | 'observed' | 'true' | 'compare'
             'auto' — compare если values_T != values_T_true, иначе true
         """
-        from .plotting import _import_mpl
-        plt = _import_mpl()
+        from .plotstyle import new_figure, style_axes, SEMANTIC, DEFAULTS
 
         has_noise = not np.allclose(self.values_T, self.values_T_true)
         if which == 'auto':
@@ -459,35 +458,39 @@ class ChannelizedSpectrum:
         }[kind]
 
         if ax is None:
-            fig, ax = plt.subplots(figsize=figsize or (9, 4.5))
+            fig, ax = new_figure(figsize=figsize)
         else:
             fig = ax.figure
 
         x = self.centers
         # Ширина столбца — половина FWHM, чтобы было видно структуру
         width = self.fwhms * 0.5
+        c_obs = SEMANTIC['observed']
 
         if which == 'compare':
             true_v = _vals_for(kind, 'true')
             obs_v = _vals_for(kind, 'observed')
-            ax.bar(x, obs_v, width=width, color='C0', alpha=0.6,
-                   label='наблюдаемое', edgecolor='C0')
-            ax.plot(x, true_v, 'o-', color='C3', lw=1.0, markersize=5,
+            ax.bar(x, obs_v, width=width, color=c_obs, alpha=0.6,
+                   label='наблюдаемое', edgecolor=c_obs)
+            ax.plot(x, true_v, 'o-', color=SEMANTIC['true'], lw=1.0, markersize=5,
                     label='истина')
         elif which == 'true':
-            ax.bar(x, _vals_for(kind, 'true'), width=width, color='C0',
-                   alpha=0.7, edgecolor='C0', label='истина')
+            ax.bar(x, _vals_for(kind, 'true'), width=width, color=c_obs,
+                   alpha=0.7, edgecolor=c_obs, label='истина')
         elif which == 'observed':
-            ax.bar(x, _vals_for(kind, 'observed'), width=width, color='C0',
-                   alpha=0.7, edgecolor='C0', label='наблюдаемое')
+            ax.bar(x, _vals_for(kind, 'observed'), width=width, color=c_obs,
+                   alpha=0.7, edgecolor=c_obs, label='наблюдаемое')
 
         ax.set_xlabel('Центр канала, нм')
         ax.set_ylabel(ylabel)
         ax.set_title(title or f"Channelized: {self.channels.name}")
-        ax.grid(True, alpha=0.3)
+        style_axes(ax)
         if which == 'compare':
-            ax.legend()
-        fig.tight_layout()
+            ax.legend(loc=DEFAULTS['legend_loc'],
+                      framealpha=DEFAULTS['legend_framealpha'],
+                      fontsize=DEFAULTS['legend_size'])
+        if DEFAULTS['tight_layout']:
+            fig.tight_layout()
         return fig, ax
 
 

@@ -575,6 +575,17 @@ class Spectrum:
         from .plotting import plot_clean_vs_noisy
         return plot_clean_vs_noisy(self, kind=kind, figsize=figsize)
 
+    def save(self, filepath, kind='transmittance', fmt=None, include_true=True):
+        """
+        Сохранить спектр в файл.
+
+        Формат определяется по расширению (.csv/.txt — CSV с шапкой;
+        .npz — бинарный архив со всеми массивами). См. io.save_spectrum.
+        """
+        from .io import save_spectrum
+        return save_spectrum(self, filepath, kind=kind, fmt=fmt,
+                             include_true=include_true)
+
     def __repr__(self):
         wl0, wl1 = self.wavelength_nm[0], self.wavelength_nm[-1]
         n = len(self.wavelength_nm)

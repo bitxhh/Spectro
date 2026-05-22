@@ -10,7 +10,7 @@ Python-библиотека для синтеза и обработки абсо
 спектрометра по известному составу смеси — оптимизация параметров
 прибора, валидация алгоритмов обработки, обучающие выборки для ML.
 
-**Текущая версия: 0.6.0**
+**Текущая версия: 0.7.0**
 
 ## Содержание
 
@@ -26,6 +26,9 @@ Python-библиотека для синтеза и обработки абсо
   - [Биомаркерные панели](#биомаркерные-панели-yamljson)
   - [Многоканальная регистрация](#многоканальная-регистрация)
   - [Визуализация](#визуализация)
+  - [Единый стиль графиков (`plotstyle`)](#единый-стиль-графиков-plotstyle)
+  - [Сохранение и загрузка спектров](#сохранение-и-загрузка-спектров)
+  - [Управление кешем HITRAN](#управление-кешем-hitran)
 - [Два стиля API](#два-стиля-api)
 - [Структура пакета](#структура-пакета)
 - [Тесты](#тесты)
@@ -53,19 +56,30 @@ Python-библиотека для синтеза и обработки абсо
 
 ## Установка
 
-```bash
-pip install hitran-api numpy scipy pandas matplotlib pyyaml pytest
-```
-
-Для использования пакета положите каталог `spectrolib/` в путь импорта
-Python либо установите в режиме разработки:
+Из корня репозитория:
 
 ```bash
 pip install -e .
 ```
 
+Зависимости (numpy, scipy, pandas, matplotlib, pyyaml, hitran-api)
+подтянутся автоматически из `pyproject.toml`. Опционально:
+
+```bash
+pip install -e ".[test]"    # + pytest
+pip install -e ".[excel]"   # + openpyxl (для .xlsx через load_spectrum)
+```
+
+После установки пакет можно импортировать в любом проекте:
+
+```python
+from spectrolib import Spectrum, GaussILS, NoiseModel
+from spectrolib.plotstyle import plot, scatter, bar, hist, errorbar
+```
+
 При первом обращении к молекуле через HAPI её таблица будет скачана с
-сервера HITRAN и закеширована локально.
+сервера HITRAN и закеширована локально (см. [управление кешем
+HITRAN](#управление-кешем-hitran)).
 
 ## Быстрый старт
 
@@ -321,6 +335,122 @@ plot_snr_vs_n(result)                  # зависимость SNR от N
 глубину линий. Все функции возвращают пару `(fig, ax)`, так что стиль
 можно дотюнить штатными средствами matplotlib.
 
+### Единый стиль графиков (`plotstyle`)
+
+`spectrolib.plotstyle` — самодостаточный модуль со стилизованными
+обёртками над matplotlib. Импортируется отдельно и пригоден для любых
+других проектов, не только спектров:
+
+```python
+from spectrolib.plotstyle import plot, scatter, bar, hist, errorbar
+from spectrolib.plotstyle import subplots, save, apply_style
+from spectrolib.plotstyle import PALETTE, SEMANTIC, MARKERS, DEFAULTS
+
+plot(x, y, xlabel='λ, нм', ylabel='T', title='Spectrum',
+     label='наблюдение', color='accent', log_y=True)
+```
+
+Все функции — `plot/scatter/bar/hist/errorbar` — принимают одинаковый
+набор удобных параметров: `xlabel/ylabel/title`, `label` (легенда
+включается автоматически), `color/marker/linestyle`, `log_x/log_y`,
+`figsize`, `ax` (для составных графиков). Возвращают `ax`
+(`ax.figure` даёт фигуру). Стиль (сетка, minor ticks, шрифты,
+обрезанные верх/правая рамки) применяется автоматически.
+
+**Палитра** — Okabe-Ito, безопасная для дальтоников. Цвет можно задать
+именем (`'primary'`, `'accent'`, `'success'`, ...) или семантически
+(`'observed'`, `'true'`, `'diff'`, `'theory'`):
+
+```python
+plot(x, y_obs, color='observed')
+plot(x, y_true, color='true', linestyle='--', ax=ax)
+```
+
+**Сетка подграфиков** одной командой со стилем, применённым ко всем
+осям, и адаптивным размером:
+
+```python
+fig, axes = subplots(2, 3)              # 6 осей, удобный итератор
+for ax, data in zip(axes, datasets):
+    plot(data.x, data.y, ax=ax)
+```
+
+**Сохранение в LaTeX-качестве** — вектор по дефолту:
+
+```python
+ax = plot(x, y, xlabel='λ, нм', ylabel='T')
+save(ax, 'fig.pdf')                     # PDF — для LaTeX (без потери качества)
+save(ax, 'fig.png')                     # PNG — 300 dpi из DEFAULTS
+```
+
+**Дефолты** (`DEFAULTS`) — мутабельный dict; меняйте под себя одной
+строкой в начале ноутбука:
+
+```python
+from spectrolib import plotstyle
+plotstyle.DEFAULTS['figsize'] = (10, 5)
+plotstyle.DEFAULTS['savefig_dpi'] = 600
+```
+
+**LaTeX-режим** через `apply_style(preset='latex')` — подменяет
+шрифты на Computer Modern и включает `text.usetex` (нужен
+установленный LaTeX). Для тезисов без жёсткой типографики есть
+preset `'mathtext'` — Computer Modern через mathtext без зависимости
+от внешнего LaTeX:
+
+```python
+from spectrolib.plotstyle import apply_style
+
+# В начале ноутбука: применяет дефолты ко всем последующим plt.plot
+apply_style(preset='mathtext')
+# Откат при желании: prev = apply_style(...); plt.rcParams.update(prev)
+```
+
+`spec.plot()` и остальные функции из `spectrolib.plotting` уже
+используют этот же стиль внутри — графики из библиотеки и ваши
+собственные через `plotstyle` выглядят одинаково.
+
+### Сохранение и загрузка спектров
+
+```python
+spec.save('spec.csv')                    # CSV с метаданными в шапке
+spec.save('spec.csv', kind='absorbance') # любая величина
+spec.save('archive.npz')                 # полный архив (все массивы + JSON-meta)
+spec.save('spec.csv', include_true=False) # без колонки эталона (для load_spectrum)
+```
+
+CSV-шапка содержит `# kind:`, `# molecules:`, `# T_K/p_atm/L_cm:`,
+условия ILS/шумов и полный JSON-блок `metadata_json:` для машинного
+восстановления контекста. Совместим с `load_spectrum()`:
+
+```python
+from spectrolib import load_spectrum
+wl, vals, meta = load_spectrum('spec.csv')
+print(meta['kind'])      # 'transmittance'
+```
+
+NPZ — для долгого хранения: внутри `wavelength_nm`, `observed`,
+`true`, `clean_optical_depth`, `noise_T`, `noise_OD` и полная
+`metadata_json` (JSON-строка с молекулами, ILS, шумами, историей).
+
+### Управление кешем HITRAN
+
+При первом обращении к молекуле HAPI скачивает таблицу линий и
+сохраняет её локально. Эти таблицы можно листать и чистить:
+
+```python
+from spectrolib import list_local_tables
+from spectrolib.hitran import clear_cache
+
+list_local_tables()                    # имена всех закешированных таблиц
+clear_cache('O2_759-775nm')            # удалить одну таблицу
+clear_cache()                          # снести весь кеш (для перекачки с нуля)
+```
+
+`clear_cache()` удаляет файлы `.data`/`.header` с диска **и** сбрасывает
+in-memory кеш HAPI — следующий `fetch_molecule` гарантированно сходит
+на сервер заново.
+
 ## Два стиля API
 
 Оба стиля живут в одной и той же кодовой базе, можно смешивать.
@@ -391,17 +521,19 @@ result = gen.snr_vs_n_realizations(
 
 ```
 spectrolib/
+├── pyproject.toml          — packaging (pip install -e .)
 ├── __init__.py             — публичный API
 ├── physics.py              — константы (scipy.constants), единицы, Бугер-Ламберт
-├── hitran.py               — обёртка над HAPI
+├── hitran.py               — обёртка над HAPI + clear_cache
 ├── ils.py                  — ILS (Gauss/Lorentz/Voigt/FromFile)
 ├── noise.py                — NoiseModel и 6 видов шума
 ├── spectrum.py             — главный класс Spectrum (fluent)
 ├── api.py                  — Instrument, GasMixture, SpectrumGenerator
-├── plotting.py             — единая визуализация
+├── plotting.py             — спектр-специфичные графики
+├── plotstyle.py            — универсальный модуль стиля + plot/scatter/bar/hist
 ├── panels.py               — MixturePanel: декларативные конфиги смесей
 ├── channels.py             — Channel/ChannelSet/ChannelizedSpectrum
-├── io.py                   — загрузка CSV/TXT/XLSX
+├── io.py                   — load_spectrum / save_spectrum (CSV/TXT/XLSX/NPZ)
 ├── example_panels/         — примеры YAML-панелей
 ├── example_channel_sets/   — примеры YAML-конфигов каналов
 └── tests/                  — pytest-набор
@@ -440,6 +572,12 @@ cryotrap) и их характерных коэффициентов.
 
 ## История версий
 
+- **0.7.0** — модуль `plotstyle` (palette Okabe-Ito, plot/scatter/bar/
+  hist/errorbar с едиными дефолтами, `subplots()`, `save()`,
+  preset-ы `apply_style('mathtext'/'latex')`); `Spectrum.save()` и
+  `save_spectrum()` (CSV с метаданными в шапке / NPZ-архив); `clear_cache()`
+  для управления локальными таблицами HITRAN; `pyproject.toml` —
+  установка через `pip install -e .`.
 - **0.6.0** — многоканальная регистрация
   (`Channel` / `ChannelSet` / `ChannelizedSpectrum`); переход
   «тонкая сетка → каналы прибора» одной командой; реальные QD как

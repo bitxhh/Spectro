@@ -63,10 +63,11 @@ from .physics import (
 
 # Работа с HITRAN и I/O
 from .hitran import fetch_molecule, list_local_tables, MOLECULE_IDS
-from .io import load_spectrum
+from .io import load_spectrum, save_spectrum
 
 # Визуализация
 from .plotting import plot_spectrum, plot_clean_vs_noisy, plot_overlay, plot_snr_vs_n
+from . import plotstyle  # отдельный модуль с едиными дефолтами/палитрой
 
 # Биомаркерные панели
 from .panels import MixturePanel, Biomarker, load_mixture_panel
@@ -93,9 +94,10 @@ __all__ = [
     'ppm_to_fraction', 'fraction_to_ppm', 'beer_lambert',
     # HITRAN и I/O
     'fetch_molecule', 'list_local_tables', 'MOLECULE_IDS',
-    'load_spectrum',
+    'load_spectrum', 'save_spectrum',
     # Визуализация
     'plot_spectrum', 'plot_clean_vs_noisy', 'plot_overlay', 'plot_snr_vs_n',
+    'plotstyle',
     # Биомаркерные панели
     'MixturePanel', 'Biomarker', 'load_mixture_panel',
     # Многоканальная регистрация
@@ -103,4 +105,4 @@ __all__ = [
     'channelize', 'load_channel_set',
 ]
 
-__version__ = '0.6.0'
+__version__ = '0.7.0'

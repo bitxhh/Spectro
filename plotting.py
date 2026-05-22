@@ -18,21 +18,8 @@ from __future__ import annotations
 
 import numpy as np
 
-
-# Базовые настройки. Сознательно не трогаем глобальный rcParams —
-# пользователь может иметь свой стиль.
-_DEFAULT_FIGSIZE = (9, 4.5)
-
-
-def _import_mpl():
-    """Ленивый импорт matplotlib — чтобы библиотека работала без него."""
-    try:
-        import matplotlib.pyplot as plt
-        return plt
-    except ImportError as e:
-        raise ImportError(
-            "Для plot() нужен matplotlib: pip install matplotlib"
-        ) from e
+from . import plotstyle
+from .plotstyle import _import_mpl, style_axes, new_figure, SEMANTIC, DEFAULTS
 
 
 def _build_title(spec, extra=None):
@@ -164,7 +151,7 @@ def plot_spectrum(spec, kind='transmittance', which='auto',
         which = 'compare' if has_noise else 'true'
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=figsize or _DEFAULT_FIGSIZE)
+        fig, ax = new_figure(figsize=figsize)
     else:
         fig = ax.figure
 
@@ -178,9 +165,9 @@ def plot_spectrum(spec, kind='transmittance', which='auto',
         else:
             y_true = _values_for(spec, kind, 'true')
             y_obs = _values_for(spec, kind, 'observed')
-            ax.plot(x, y_obs, color='C0', lw=1.0, alpha=0.85,
+            ax.plot(x, y_obs, color=SEMANTIC['observed'], lw=1.0, alpha=0.85,
                     label='наблюдаемое', **plot_kwargs)
-            ax.plot(x, y_true, color='C3', lw=1.5, ls='--',
+            ax.plot(x, y_true, color=SEMANTIC['true'], lw=1.5, ls='--',
                     label='истина')
     elif which in ('true', 'observed'):
         y = _values_for(spec, kind, which)
@@ -207,14 +194,15 @@ def plot_spectrum(spec, kind='transmittance', which='auto',
         else:
             ax.set_ylim(max(0.0, y_min - 0.05), 1.02)
 
-    ax.grid(True, which='major', alpha=0.3)
-    ax.minorticks_on()
-    ax.grid(True, which='minor', alpha=0.1)
+    style_axes(ax)
 
     if show_legend:
-        ax.legend(loc='best', framealpha=0.9)
+        ax.legend(loc=DEFAULTS['legend_loc'],
+                  framealpha=DEFAULTS['legend_framealpha'],
+                  fontsize=DEFAULTS['legend_size'])
 
-    fig.tight_layout()
+    if DEFAULTS['tight_layout']:
+        fig.tight_layout()
     return fig, ax
 
 
@@ -230,8 +218,11 @@ def plot_clean_vs_noisy(spec, kind='transmittance', figsize=None):
     насколько препроцессинг должен «вытаскивать» истину.
     """
     plt = _import_mpl()
+    # 2-панельный лэйаут: используем DEFAULTS для ширины, высота — увеличена
+    base_w, _ = DEFAULTS['figsize']
     fig, (ax_top, ax_bot) = plt.subplots(
-        2, 1, figsize=figsize or (9, 6),
+        2, 1, figsize=figsize or (base_w, base_w * 0.6),
+        dpi=DEFAULTS['dpi'],
         sharex=True, gridspec_kw={'height_ratios': [3, 1]},
     )
     plot_spectrum(spec, kind=kind, which='compare',
@@ -241,17 +232,18 @@ def plot_clean_vs_noisy(spec, kind='transmittance', figsize=None):
     obs = _values_for(spec, kind, 'observed')
     tru = _values_for(spec, kind, 'true')
     diff = obs - tru
-    ax_bot.plot(spec.wavelength_nm, diff, color='C2', lw=0.8)
+    ax_bot.plot(spec.wavelength_nm, diff, color=SEMANTIC['diff'], lw=0.8)
     ax_bot.axhline(0, color='k', lw=0.5, alpha=0.5)
     ax_bot.set_xlabel('Длина волны, нм')
     ax_bot.set_ylabel('Шум\n(набл. − истина)')
-    ax_bot.grid(True, alpha=0.3)
+    style_axes(ax_bot)
     rms = float(np.sqrt(np.mean(diff ** 2)))
     ax_bot.text(0.99, 0.95, f'RMS = {rms:.4g}',
                 transform=ax_bot.transAxes,
                 ha='right', va='top',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    fig.tight_layout()
+    if DEFAULTS['tight_layout']:
+        fig.tight_layout()
     return fig, (ax_top, ax_bot)
 
 
@@ -268,8 +260,7 @@ def plot_overlay(specs, labels=None, kind='transmittance',
     kind : см. plot_spectrum
     which : {'true', 'observed'}
     """
-    plt = _import_mpl()
-    fig, ax = plt.subplots(figsize=figsize or _DEFAULT_FIGSIZE)
+    fig, ax = new_figure(figsize=figsize)
     if labels is None:
         labels = [f'spec {i}' for i in range(len(specs))]
     for s, lab in zip(specs, labels):
@@ -279,11 +270,12 @@ def plot_overlay(specs, labels=None, kind='transmittance',
     ax.set_ylabel(_ylabel_for(kind))
     if title:
         ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    ax.minorticks_on()
-    ax.grid(True, which='minor', alpha=0.1)
-    ax.legend(loc='best', framealpha=0.9)
-    fig.tight_layout()
+    style_axes(ax)
+    ax.legend(loc=DEFAULTS['legend_loc'],
+              framealpha=DEFAULTS['legend_framealpha'],
+              fontsize=DEFAULTS['legend_size'])
+    if DEFAULTS['tight_layout']:
+        fig.tight_layout()
     return fig, ax
 
 
@@ -308,22 +300,22 @@ def plot_snr_vs_n(snr_data, figsize=None, title=None,
     -------
     (fig, ax)
     """
-    import numpy as _np
-    plt = _import_mpl()
-
     n_values = snr_data['n_values']
     snr_mean = snr_data['snr_mean']
     snr_std = snr_data['snr_std']
     theoretical = snr_data['theoretical']
 
-    fig, ax = plt.subplots(figsize=figsize or _DEFAULT_FIGSIZE)
+    fig, ax = new_figure(figsize=figsize)
 
     ax.errorbar(n_values, snr_mean, yerr=snr_std, fmt='o-',
-                color='C0', capsize=3, lw=1.5, markersize=6,
+                color=SEMANTIC['observed'],
+                capsize=DEFAULTS['errorbar_capsize'],
+                lw=DEFAULTS['lw'], markersize=6,
                 label='измеренный SNR (среднее ± СКО)')
 
     if show_theoretical:
-        ax.plot(n_values, theoretical, '--', color='C3', lw=1.5,
+        ax.plot(n_values, theoretical, '--', color=SEMANTIC['theory'],
+                lw=DEFAULTS['lw'],
                 label=r'теория: SNR $\propto \sqrt{N}$')
 
     if log_log:
@@ -333,8 +325,10 @@ def plot_snr_vs_n(snr_data, figsize=None, title=None,
     ax.set_xlabel('N — число усреднённых реализаций')
     ax.set_ylabel('SNR')
     ax.set_title(title or 'SNR vs число усреднённых реализаций')
-    ax.grid(True, which='major', alpha=0.4)
-    ax.grid(True, which='minor', alpha=0.15)
-    ax.legend(loc='best', framealpha=0.9)
-    fig.tight_layout()
+    style_axes(ax)
+    ax.legend(loc=DEFAULTS['legend_loc'],
+              framealpha=DEFAULTS['legend_framealpha'],
+              fontsize=DEFAULTS['legend_size'])
+    if DEFAULTS['tight_layout']:
+        fig.tight_layout()
     return fig, ax
