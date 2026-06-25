@@ -46,10 +46,10 @@ from .ils import (
 )
 
 # Шумы
-from .noise import NoiseModel
+from .noise import NoiseModel, load_noise_model
 
 # Объектный фасад
-from .api import Instrument, GasMixture, SpectrumGenerator
+from .api import Instrument, GasMixture, SpectrumGenerator, load_instrument
 
 # Физика
 from .physics import (
@@ -62,8 +62,19 @@ from .physics import (
 )
 
 # Работа с HITRAN и I/O
-from .hitran import fetch_molecule, list_local_tables, MOLECULE_IDS
+from .hitran import fetch_molecule, list_local_tables, MOLECULE_IDS, T_REF_HITRAN_K
 from .io import load_spectrum, save_spectrum
+
+# Реестр источников сечений (HITRAN / PNNL / MPI / HITRAN xsc)
+from .databases import (
+    DB_HITRAN, DB_PNNL, DB_MPI, DB_HITRAN_XSC,
+    MOLECULE_SOURCE, register_molecule, resolve_source,
+)
+# Доп. базы данных сечений
+from . import pnnl, mpi, hitran_xsc
+
+# Этапы пробоподготовки / протокол измерения
+from .protocol import preconcentrate
 
 # Визуализация
 from .plotting import plot_spectrum, plot_clean_vs_noisy, plot_overlay, plot_snr_vs_n
@@ -78,6 +89,17 @@ from .channels import (
     channelize, load_channel_set,
 )
 
+# Покомпонентный информационный аудит (глава 4 диплома)
+from .audit import (
+    LocalBlock, AuditResult,
+    audit_block, design_concentrations, lognormal_percentile,
+    compute_J_star_min, compute_kappa_max, round_kappa_floor,
+    build_response_matrix, build_noise_covariance_OD,
+    build_drift_basis, oblique_projector_perp, marginal_fisher,
+    compute_J_star_m, population_params,
+    plot_audit_trajectory, plot_audit_configuration,
+)
+
 
 __all__ = [
     # Основной класс
@@ -86,15 +108,21 @@ __all__ = [
     'ILS', 'GaussILS', 'LorentzILS', 'VoigtILS', 'FromFileILS',
     'fwhm_to_sigma', 'sigma_to_fwhm', 'gauss_convolve',
     # Шумы
-    'NoiseModel',
+    'NoiseModel', 'load_noise_model',
     # Объектный фасад
-    'Instrument', 'GasMixture', 'SpectrumGenerator',
+    'Instrument', 'GasMixture', 'SpectrumGenerator', 'load_instrument',
     # Физика
     'nm_to_wavenumber', 'wavenumber_to_nm', 'number_density',
     'ppm_to_fraction', 'fraction_to_ppm', 'beer_lambert',
     # HITRAN и I/O
-    'fetch_molecule', 'list_local_tables', 'MOLECULE_IDS',
+    'fetch_molecule', 'list_local_tables', 'MOLECULE_IDS', 'T_REF_HITRAN_K',
     'load_spectrum', 'save_spectrum',
+    # Реестр источников сечений и доп. базы данных
+    'DB_HITRAN', 'DB_PNNL', 'DB_MPI', 'DB_HITRAN_XSC',
+    'MOLECULE_SOURCE', 'register_molecule', 'resolve_source',
+    'pnnl', 'mpi', 'hitran_xsc',
+    # Протокол измерения
+    'preconcentrate',
     # Визуализация
     'plot_spectrum', 'plot_clean_vs_noisy', 'plot_overlay', 'plot_snr_vs_n',
     'plotstyle',
@@ -103,6 +131,14 @@ __all__ = [
     # Многоканальная регистрация
     'Channel', 'ChannelSet', 'ChannelizedSpectrum',
     'channelize', 'load_channel_set',
+    # Покомпонентный аудит
+    'LocalBlock', 'AuditResult',
+    'audit_block', 'design_concentrations', 'lognormal_percentile',
+    'compute_J_star_min', 'compute_kappa_max', 'round_kappa_floor',
+    'build_response_matrix', 'build_noise_covariance_OD',
+    'build_drift_basis', 'oblique_projector_perp', 'marginal_fisher',
+    'compute_J_star_m', 'population_params',
+    'plot_audit_trajectory', 'plot_audit_configuration',
 ]
 
-__version__ = '0.7.0'
+__version__ = '0.8.0'

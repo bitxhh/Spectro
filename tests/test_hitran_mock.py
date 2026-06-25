@@ -150,6 +150,58 @@ class TestInterpolation:
         assert od[: len(od) // 4].mean() > od[-len(od) // 4 :].mean()
 
 
+class TestTemperatureForwardedToHapi:
+    """
+    Проверка: T_K из GasMixture/add_molecule долетает до hapi через
+    Environment={'T': T_K, 'p': p_atm}. Это и есть «температурная
+    коррекция сечений HITRAN»: hapi внутри пересчитывает S(T) от
+    опорной T_REF_HITRAN_K=296 K через Q(T)/Q(T_ref).
+    """
+
+    def test_T_K_forwarded_to_hapi_environment(self):
+        captured = {}
+
+        def capture(SourceTables, Environment, WavenumberRange,
+                    WavenumberStep, WavenumberWing, Diluent,
+                    HITRAN_units):
+            captured['Environment'] = dict(Environment)
+            return _fake_voigt(SourceTables, Environment, WavenumberRange,
+                                WavenumberStep, WavenumberWing, Diluent,
+                                HITRAN_units)
+
+        with patch('hapi.absorptionCoefficient_Voigt', side_effect=capture):
+            spec = Spectrum.from_range(750, 770, step_nm=0.01)
+            spec.add_molecule('O2', c_ppm=1000, L_cm=10,
+                              T_K=310.0, p_atm=1.0)
+
+        assert captured['Environment']['T'] == 310.0
+        assert captured['Environment']['p'] == 1.0
+
+    def test_T_REF_constant_exported(self):
+        from spectrolib import T_REF_HITRAN_K
+        assert T_REF_HITRAN_K == 296.0
+
+    def test_different_T_K_passed_through(self):
+        """При разных T_K hapi должен получить именно эту T (296 vs 310)."""
+        calls = []
+
+        def capture(SourceTables, Environment, WavenumberRange,
+                    WavenumberStep, WavenumberWing, Diluent,
+                    HITRAN_units):
+            calls.append(Environment['T'])
+            return _fake_voigt(SourceTables, Environment, WavenumberRange,
+                                WavenumberStep, WavenumberWing, Diluent,
+                                HITRAN_units)
+
+        with patch('hapi.absorptionCoefficient_Voigt', side_effect=capture):
+            s1 = Spectrum.from_range(750, 770, step_nm=0.01)
+            s1.add_molecule('O2', c_ppm=1000, L_cm=10, T_K=296.0)
+            s2 = Spectrum.from_range(750, 770, step_nm=0.01)
+            s2.add_molecule('O2', c_ppm=1000, L_cm=10, T_K=310.0)
+
+        assert calls == [296.0, 310.0]
+
+
 class TestMetadataAfterHITRAN:
 
     def test_molecule_record_complete(self):

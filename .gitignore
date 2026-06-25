@@ -38,6 +38,24 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+._*
 
-# HITRAN local cache (создаётся init_db('hitran_data'))
+# Obsidian vault
+.obsidian/
+
+# Локальные кеши/данные баз сечений (скачиваются/симлинкуются локально)
 hitran_data/
+pnnl_data/
+mpi_data
+mpi_data/
+hitran_xsc_data
+hitran_xsc_data/
+
+# Внутренние черновики и выгрузки из текста диплома
+_extract_pdf.py
+_main_text.txt
+_make_figures.py
+_sampledata/
+
+# Сгенерированные результаты расчётов
+results/

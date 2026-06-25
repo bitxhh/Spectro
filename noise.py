@@ -299,3 +299,74 @@ class NoiseModel:
             'spike_rate': self.spike_rate,
             'spike_amplitude_range': self.spike_amplitude_range,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'NoiseModel':
+        """
+        Создать NoiseModel из словаря (YAML/JSON-конфиг).
+
+        Поддерживаются все поля to_dict; дополнительно допускаются
+        мета-поля 'name', 'reference', 'notes' — они игнорируются здесь
+        (но могут читаться panel-like загрузчиком).
+        """
+        fields = {
+            'thermal_sigma', 'shot_n_photons_max',
+            'colored_sigma', 'colored_ar',
+            'drift_amplitude', 'drift_n_terms',
+            'periodic', 'spike_rate', 'spike_amplitude_range',
+        }
+        # Скалярные float-поля: страхуемся от YAML 1.1, который
+        # распознаёт "1.0e6" как строку (без знака в экспоненте).
+        float_fields = {
+            'thermal_sigma', 'shot_n_photons_max',
+            'colored_sigma', 'colored_ar',
+            'drift_amplitude', 'spike_rate',
+        }
+        kwargs = {k: v for k, v in d.items() if k in fields and v is not None}
+        for k in list(kwargs):
+            if k in float_fields and isinstance(kwargs[k], str):
+                kwargs[k] = float(kwargs[k])
+        # periodic в YAML — список списков (period, amp, phase); приводим к tuple.
+        if 'periodic' in kwargs:
+            kwargs['periodic'] = [tuple(p) for p in kwargs['periodic']]
+        if 'spike_amplitude_range' in kwargs:
+            kwargs['spike_amplitude_range'] = tuple(kwargs['spike_amplitude_range'])
+        return cls(**kwargs)
+
+    @classmethod
+    def from_file(cls, path) -> 'NoiseModel':
+        """
+        Загрузить NoiseModel из YAML/JSON.
+
+        Поддерживаются те же расширения, что и MixturePanel: .yaml/.yml/.json.
+        Поля верхнего уровня — параметры NoiseModel; меta-поля name/reference/notes
+        игнорируются (хранятся отдельно через meta-словарь, если нужно).
+        """
+        from pathlib import Path as _Path
+        import json as _json
+
+        p = _Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"NoiseModel: файл не найден: {p}")
+        text = p.read_text(encoding='utf-8')
+        ext = p.suffix.lower()
+        if ext in ('.yaml', '.yml'):
+            try:
+                import yaml as _yaml
+            except ImportError as e:
+                raise ImportError(
+                    "Для чтения YAML установи pyyaml: pip install pyyaml."
+                ) from e
+            data = _yaml.safe_load(text)
+        elif ext == '.json':
+            data = _json.loads(text)
+        else:
+            raise ValueError(
+                f"Поддерживаются .yaml/.yml/.json, получено {ext!r}"
+            )
+        return cls.from_dict(data or {})
+
+
+def load_noise_model(path) -> 'NoiseModel':
+    """Шорткат: load_noise_model('foo.yaml') == NoiseModel.from_file(...)."""
+    return NoiseModel.from_file(path)

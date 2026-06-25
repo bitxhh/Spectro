@@ -43,6 +43,12 @@ from .physics import nm_to_wavenumber, wavenumber_to_nm, beer_lambert
 from .hitran import fetch_molecule, init_db
 from .ils import ILS, GaussILS, gauss_convolve  # noqa: F401  (gauss_convolve для обратной совместимости)
 from .noise import NoiseModel
+from .databases import (
+    resolve_source, DB_HITRAN, DB_PNNL, DB_MPI, DB_HITRAN_XSC,
+)
+from . import pnnl as _pnnl
+from . import mpi as _mpi
+from . import hitran_xsc as _hxsc
 
 
 class Spectrum:
@@ -206,61 +212,145 @@ class Spectrum:
                      table_name=None, profile='voigt',
                      wing_cm=10.0, diluent=None,
                      step_cm=None,
+                     source=None, sources=None,
+                     sigma_T_K=None, air_to_vacuum=False,
                      verbose=False):
         """
         Добавляет вклад молекулы в чистую OD спектра.
 
-        Использует HITRAN/hapi для расчёта коэффициента поглощения
-        на тонкой сетке, затем линейно интерполирует на сетку спектра.
+        Сечение σ [см²/молекула] берётся из одного из трёх источников
+        (см. spectrolib.databases): 'hitran' (line-by-line через hapi),
+        'pnnl' (ИК-сечения VOC из PNNL IR Database) или 'mpi' (УФ/ВИД из
+        MPI-Mainz Spectral Atlas). Источник выбирается через resolve_source:
+        явный source= > локальная карта sources= > реестр MOLECULE_SOURCE >
+        дефолт 'hitran'. Независимо от источника дальше всё одинаково:
+        OD = σ·N(T,p)·L и интерполяция на сетку спектра — это гарантирует
+        согласованность баз (общая единица σ, общая формула OD).
 
         Parameters
         ----------
         name : str
-            Имя молекулы ('O2', 'CO2', 'H2O', ...). См. MOLECULE_IDS.
+            Имя молекулы. Для HITRAN — см. MOLECULE_IDS; для PNNL/MPI — как
+            зарегистрировано в соответствующем загрузчике.
         c_ppm : float
             Концентрация в ppm.
         L_cm : float
             Длина пути, см.
         T_K, p_atm : float
-            Температура и давление.
+            Температура (K) и давление (атм). В законе Бугера–Ламберта–Бера
+            числовая плотность N(T,p) считается ВСЕГДА по этим значениям.
+            Для HITRAN T_K дополнительно влияет на форму/силу линий внутри
+            hapi (пересчёт от 296 K через Q(T)).
         table_name : str, optional
-            Имя локальной HITRAN-таблицы. Если None — fetch_molecule
-            подберёт автоматически по диапазону.
+            (HITRAN) имя локальной таблицы; None → fetch_molecule подберёт.
         profile : {'voigt', 'lorentz', 'gauss'}
-            Профиль линии. Voigt — универсальный.
+            (HITRAN) профиль линии.
         wing_cm : float
-            Запас по краям при расчёте, см⁻¹.
+            (HITRAN) запас по краям, см⁻¹.
         diluent : dict, optional
-            Состав уширяющей среды для hapi, например
-            {'air': 0.96, 'self': 0.04} для CO₂ в выдохе.
-            По умолчанию {'air': 1.0} (тонкая концентрация в воздухе).
+            (HITRAN) состав уширяющей среды; None → {'air': 1.0}.
         step_cm : float, optional
-            Явный шаг сетки hapi для расчёта линий, см⁻¹.
-            Если None — выбирается автоматически по сетке спектра
-            и зажимается в диапазон [0.001, 0.01] см⁻¹
-            (нижний порог = предел точности HITRAN, верхний — чтобы hapi
-            не ругался «Big wavenumber step» на узких линиях).
-            Для сверхвысокого разрешения нужно передать step_cm
-            явно — авторасчёт его не уменьшит ниже 0.001 см⁻¹.
+            (HITRAN) явный шаг сетки hapi, см⁻¹; None → авто [0.001, 0.01].
+        source : {'hitran', 'pnnl', 'mpi'}, optional
+            Явный источник сечений (высший приоритет).
+        sources : dict, optional
+            Локальная карта {имя: источник} (например, из GasMixture.sources).
+        sigma_T_K : float, optional
+            (PNNL) температура, к которой интерполируется ФОРМА σ по сетке.
+            По умолчанию строго 310 K (температура выдоха) — требование
+            диплома. Числовая плотность при этом всё равно берётся по T_K.
+        air_to_vacuum : bool
+            (MPI) переводить λ воздух→вакуум перед расчётом ν.
+        verbose : bool
+            Диагностический вывод.
+        """
+        src = resolve_source(name, source=source, overrides=sources)
+
+        if src == DB_HITRAN:
+            nu_grid, sigma, extra_meta = self._sigma_hitran(
+                name, T_K=T_K, p_atm=p_atm, table_name=table_name,
+                profile=profile, wing_cm=wing_cm, diluent=diluent,
+                step_cm=step_cm, verbose=verbose,
+            )
+        elif src == DB_PNNL:
+            # Форма σ интерполируется по T строго до 310 K (или sigma_T_K).
+            T_shape = _pnnl.T_EXHALE_K if sigma_T_K is None else float(sigma_T_K)
+            nu_grid, sigma, m = _pnnl.load_pnnl_sigma(
+                name, T_target=T_shape, verbose=verbose,
+            )
+            extra_meta = {'pnnl': m, 'profile': None, 'table_name': None,
+                          'diluent': None}
+        elif src == DB_MPI:
+            T_shape = T_K if sigma_T_K is None else float(sigma_T_K)
+            nu_grid, sigma, m = _mpi.load_mpi_sigma(
+                name, T_target=T_shape, air_to_vacuum=air_to_vacuum,
+                verbose=verbose,
+            )
+            extra_meta = {'mpi': m, 'profile': None, 'table_name': None,
+                          'diluent': None}
+        elif src == DB_HITRAN_XSC:
+            # Sharpe/PNNL VOC через HITRAN xsc. T-интерполяция на 310 K
+            # (или sigma_T_K), как и для родного PNNL.
+            T_shape = _hxsc.T_EXHALE_K if sigma_T_K is None else float(sigma_T_K)
+            nu_grid, sigma, m = _hxsc.load_xsc_sigma(
+                name, T_target=T_shape, verbose=verbose,
+            )
+            extra_meta = {'hitran_xsc': m, 'profile': None,
+                          'table_name': None, 'diluent': None}
+        else:  # pragma: no cover — resolve_source гарантирует допустимость
+            raise ValueError(f"Неизвестный источник '{src}'")
+
+        self._accumulate_sigma(nu_grid, sigma, c_ppm=c_ppm, L_cm=L_cm,
+                               T_K=T_K, p_atm=p_atm)
+
+        record = {
+            'name': name, 'c_ppm': c_ppm, 'L_cm': L_cm,
+            'T_K': T_K, 'p_atm': p_atm, 'source': src,
+            'profile': extra_meta.get('profile'),
+            'table_name': extra_meta.get('table_name'),
+            'diluent': extra_meta.get('diluent'),
+        }
+        if 'pnnl' in extra_meta:
+            record['pnnl'] = extra_meta['pnnl']
+        if 'mpi' in extra_meta:
+            record['mpi'] = extra_meta['mpi']
+        if 'hitran_xsc' in extra_meta:
+            record['hitran_xsc'] = extra_meta['hitran_xsc']
+        self.molecules.append(record)
+
+        self.history.append(
+            f"add_molecule({name}, c={c_ppm} ppm, L={L_cm} cm, "
+            f"T={T_K} K, p={p_atm} atm, source={src})"
+        )
+        return self
+
+    # -----------------------------------------------------------------
+    # Получение σ из источников и общий хвост σ→OD→сетка
+    # -----------------------------------------------------------------
+
+    def _sigma_hitran(self, name, T_K, p_atm, table_name, profile,
+                      wing_cm, diluent, step_cm, verbose):
+        """
+        Рассчитать σ(ν) молекулы через hapi (line-by-line).
+
+        Returns
+        -------
+        nu_grid : np.ndarray   (см⁻¹, по возрастанию)
+        sigma : np.ndarray     (см²/молекула)
+        meta : dict            (profile, table_name, diluent)
         """
         init_db()
         wl_min = float(self.wavelength_nm.min())
         wl_max = float(self.wavelength_nm.max())
 
         if table_name is None:
-            table_name = fetch_molecule(name,
-                                         wl_min_nm=wl_min,
-                                         wl_max_nm=wl_max)
+            table_name = fetch_molecule(name, wl_min_nm=wl_min,
+                                        wl_max_nm=wl_max)
 
         nu_min = nm_to_wavenumber(wl_max)   # меньшее ν
         nu_max = nm_to_wavenumber(wl_min)   # большее ν
 
-        # Шаг сетки hapi для расчёта линий.
-        # Дефолтный выбор: min(d_nu_native/5, 0.01 см⁻¹).
-        # 0.01 см⁻¹ — потолок, чтобы не получать "Big wavenumber step"
-        # от hapi на типичных ширинах линий 0.05-0.1 см⁻¹.
-        # 0.001 см⁻¹ — пол, ниже не имеет смысла (точность HITRAN).
-        # Можно явно задать параметром step_cm.
+        # Шаг сетки hapi: min(d_nu_native/5, 0.01), пол 0.001 см⁻¹.
         if step_cm is None:
             d_nu_native = float(np.abs(np.mean(np.diff(self.wavenumber_cm))))
             step_cm_use = max(0.001, min(0.01, d_nu_native / 5))
@@ -276,10 +366,7 @@ class Spectrum:
         if diluent is None:
             diluent = {'air': 1.0}
 
-        # HITRAN_units=True → σ в см²/молекула (фундаментальная
-        # характеристика молекулы, не зависит от концентрации).
-        # Diluent влияет только на форму линии (столкновительное уширение).
-        # verbose=False подавляет диагностический вывод hapi.
+        # HITRAN_units=True → σ в см²/молекула. verbose=False глушит вывод hapi.
         import io as _io
         import contextlib as _ctx
         _sink = _io.StringIO() if not verbose else None
@@ -294,28 +381,32 @@ class Spectrum:
                 Diluent=diluent,
                 HITRAN_units=True,
             )
+        return nu_grid, sigma, {'profile': profile, 'table_name': table_name,
+                                'diluent': dict(diluent)}
+
+    def _accumulate_sigma(self, nu_grid, sigma, c_ppm, L_cm, T_K, p_atm):
+        """
+        Общий хвост для всех источников: σ → OD (закон БЛБ) → интерполяция
+        на сетку спектра → накопление в _clean_optical_depth.
+
+        nu_grid должна быть по возрастанию. За пределами диапазона данных
+        вклад зануляется (left=0, right=0) — это важно для PNNL/MPI, чьи
+        измеренные диапазоны уже сетки спектра: нельзя «размазывать» краевое
+        σ на всю сетку.
+        """
+        nu_grid = np.asarray(nu_grid, dtype=float)
+        sigma = np.asarray(sigma, dtype=float)
 
         # OD = σ · N_target · L,  N_target = (c_ppm·1e-6) · N_total(T, p)
         od_native = beer_lambert(sigma, c_ppm=c_ppm, L_cm=L_cm,
                                   T_K=T_K, p_atm=p_atm)
 
-        # Интерполяция на сетку спектра
         od_on_our_grid = np.interp(
-            self.wavenumber_cm[::-1], nu_grid, od_native
+            self.wavenumber_cm[::-1], nu_grid, od_native,
+            left=0.0, right=0.0,
         )[::-1]
 
         self._clean_optical_depth = self._clean_optical_depth + od_on_our_grid
-
-        self.molecules.append({
-            'name': name, 'c_ppm': c_ppm, 'L_cm': L_cm,
-            'T_K': T_K, 'p_atm': p_atm, 'profile': profile,
-            'table_name': table_name, 'diluent': dict(diluent),
-        })
-        self.history.append(
-            f"add_molecule({name}, c={c_ppm} ppm, L={L_cm} cm, "
-            f"T={T_K} K, p={p_atm} atm, profile={profile})"
-        )
-        return self
 
     # -----------------------------------------------------------------
     # Аппаратная функция

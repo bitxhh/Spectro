@@ -30,10 +30,13 @@ spectrolib.api
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Union, List
+
+from pathlib import Path
+import json
 
 from .spectrum import Spectrum
-from .ils import ILS, GaussILS
+from .ils import ILS, GaussILS, LorentzILS, VoigtILS, FromFileILS
 from .noise import NoiseModel
 
 
@@ -61,6 +64,103 @@ class Instrument:
         lo, hi = self.wavelength_range
         return Spectrum.from_range(lo, hi, step_nm=self.sampling_step)
 
+    @classmethod
+    def from_dict(cls, d: Dict) -> 'Instrument':
+        """
+        Создать Instrument из словаря (YAML/JSON конфиг).
+
+        Обязательные поля верхнего уровня: wavelength_range, sampling_step.
+        Опциональное: ils (вложенный словарь с type + параметрами).
+        Метаполя name/reference/notes игнорируются.
+
+        Схема ils:
+            ils:
+              type: gauss     # | lorentz | voigt | from_file
+              fwhm: 0.208     # для gauss/lorentz
+              fwhm_g: 0.21    # для voigt
+              fwhm_l: 0.05
+              path: "..."     # для from_file
+        """
+        if 'wavelength_range' not in d:
+            raise ValueError("Instrument: обязательно поле wavelength_range")
+        if 'sampling_step' not in d:
+            raise ValueError("Instrument: обязательно поле sampling_step")
+
+        wl_range = tuple(d['wavelength_range'])
+        if len(wl_range) != 2:
+            raise ValueError(
+                f"Instrument.wavelength_range должен быть [lo, hi], "
+                f"получено {d['wavelength_range']!r}"
+            )
+
+        ils_spec = d.get('ils')
+        ils_obj: Optional[ILS] = None
+        if ils_spec is not None:
+            ils_obj = _build_ils(ils_spec)
+
+        return cls(
+            wavelength_range=(float(wl_range[0]), float(wl_range[1])),
+            sampling_step=float(d['sampling_step']),
+            ils=ils_obj,
+        )
+
+    @classmethod
+    def from_file(cls, path) -> 'Instrument':
+        """Загрузить Instrument из YAML или JSON файла."""
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Instrument: файл не найден: {p}")
+        text = p.read_text(encoding='utf-8')
+        ext = p.suffix.lower()
+        if ext in ('.yaml', '.yml'):
+            try:
+                import yaml as _yaml
+            except ImportError as e:
+                raise ImportError(
+                    "Для чтения YAML установи pyyaml: pip install pyyaml."
+                ) from e
+            data = _yaml.safe_load(text)
+        elif ext == '.json':
+            data = json.loads(text)
+        else:
+            raise ValueError(
+                f"Поддерживаются .yaml/.yml/.json, получено {ext!r}"
+            )
+        return cls.from_dict(data or {})
+
+
+def load_instrument(path) -> 'Instrument':
+    """Шорткат: load_instrument('foo.yaml') == Instrument.from_file(...)."""
+    return Instrument.from_file(path)
+
+
+def _build_ils(spec: Dict) -> ILS:
+    """
+    Построить ILS из словаря-описания.
+
+    Поддерживаются типы:
+        gauss      → GaussILS(fwhm)
+        lorentz    → LorentzILS(fwhm)
+        voigt      → VoigtILS(fwhm_g, fwhm_l)
+        from_file  → FromFileILS(path)
+    """
+    if 'type' not in spec:
+        raise ValueError(f"ILS: обязательно поле type, получено {spec!r}")
+    t = spec['type'].lower()
+    if t == 'gauss':
+        return GaussILS(fwhm=float(spec['fwhm']))
+    if t == 'lorentz':
+        return LorentzILS(fwhm=float(spec['fwhm']))
+    if t == 'voigt':
+        return VoigtILS(
+            fwhm_g=float(spec['fwhm_g']),
+            fwhm_l=float(spec['fwhm_l']),
+        )
+    if t == 'from_file':
+        return FromFileILS(path=spec['path'])
+    raise ValueError(f"ILS: неизвестный type={t!r}; "
+                     f"допустимы: gauss, lorentz, voigt, from_file")
+
 
 @dataclass
 class GasMixture:
@@ -70,6 +170,15 @@ class GasMixture:
     composition : {имя_молекулы: концентрация_в_ppm}
         Имена должны быть в spectrolib.hitran.MOLECULE_IDS.
     T_K, p_atm, L_cm — условия для всех молекул в смеси.
+
+        T_K используется в двух местах сразу:
+        (а) числовая плотность N(T,p) в законе БЛБ;
+        (б) пересчёт сил линий HITRAN от опорной T_REF_HITRAN_K=296 K к
+            рабочей температуре. Это делает hapi внутри
+            absorptionCoefficient_* через функцию распределения Q(T) и
+            больцмановский фактор exp[-c2·E"·(1/T-1/T_ref)]. То есть
+            «температурная коррекция сечений HITRAN» уже происходит,
+            пока T_K корректно доходит до hapi.
 
     diluent : dict, optional
         Состав уширяющей среды для всех молекул, передаётся в hapi.
@@ -81,6 +190,22 @@ class GasMixture:
     profile : {'voigt', 'lorentz', 'gauss'}
         Профиль для всех молекул сразу. Если нужны разные — собирай
         Spectrum вручную через add_molecule.
+
+    sources : dict, optional
+        Локальная карта {имя_молекулы: источник} для переопределения
+        источника сечений ('hitran' | 'pnnl' | 'mpi' | 'hitran_xsc').
+        Приоритетнее глобального реестра spectrolib.databases.MOLECULE_SOURCE,
+        но ниже явного source= в add_molecule. Молекулы, не указанные здесь,
+        разрешаются через реестр (дефолт — 'hitran').
+
+        Значение может быть строкой (один источник) ИЛИ списком строк
+        (несколько источников — каждый внесёт свой вклад в одну и ту же
+        концентрацию молекулы). Это нужно для биомаркеров, у которых полосы
+        поглощения лежат в разных спектральных областях и берутся из
+        разных баз: например, бензол — УФ из MPI-Mainz + ИК из HITRAN-xsc.
+        Прямая модель τ(λ) = L·Σ_m c_m·α_m(λ) при этом остаётся линейной
+        в c_m (см. §2.6 дипломной работы): каждый источник добавляет свою
+        часть α_m в общую сумму на тех ν, где он определён.
     """
     composition: Dict[str, float]
     T_K: float = 310.0          # температура выдоха
@@ -88,6 +213,7 @@ class GasMixture:
     L_cm: float = 10.0
     diluent: Optional[Dict[str, float]] = None
     profile: str = 'voigt'
+    sources: Optional[Dict[str, Union[str, List[str]]]] = None
 
     def with_L(self, L_cm):
         """Копия смеси с новой длиной пути. Удобно для оптимизации по L."""
@@ -96,6 +222,7 @@ class GasMixture:
             T_K=self.T_K, p_atm=self.p_atm, L_cm=L_cm,
             diluent=dict(self.diluent) if self.diluent else None,
             profile=self.profile,
+            sources=dict(self.sources) if self.sources else None,
         )
 
     def with_composition(self, **kwargs):
@@ -116,6 +243,48 @@ class GasMixture:
             T_K=self.T_K, p_atm=self.p_atm, L_cm=self.L_cm,
             diluent=dict(self.diluent) if self.diluent else None,
             profile=self.profile,
+            sources=dict(self.sources) if self.sources else None,
+        )
+
+    def with_T(self, T_K):
+        """
+        Копия смеси с новой температурой.
+
+        T_K=310 K — температура выдоха (дефолт), T_K=296 K — опорная T HITRAN.
+        Это параметр для hapi: сечения автоматически пересчитываются от
+        T_REF_HITRAN_K=296 K к указанной T через функцию распределения Q(T).
+        Подробнее см. docstring класса.
+        """
+        return GasMixture(
+            composition=dict(self.composition),
+            T_K=T_K, p_atm=self.p_atm, L_cm=self.L_cm,
+            diluent=dict(self.diluent) if self.diluent else None,
+            profile=self.profile,
+            sources=dict(self.sources) if self.sources else None,
+        )
+
+    def preconcentrated(self, K_pre):
+        """
+        Копия смеси с концентрациями × K_pre.
+
+        Моделирует преконцентрирование (сорбентная трубка, SPME, криотрап) —
+        этап пробоподготовки, в котором следовые компоненты концентрируются
+        на сорбенте, а потом термодесорбируются в анализатор. Эффективно
+        умножает все ppm/ppb смеси на коэффициент обогащения K_pre.
+        Типичные значения: K_pre = 10²…10⁴.
+
+        Замечание: K_pre — это безразмерный фактор обогащения по концентрации,
+        он не меняет T/p/L. Если ты моделируешь и обогащение, и изменение
+        ячейки одновременно — комбинируй с .with_L().
+        """
+        if K_pre <= 0:
+            raise ValueError(f"K_pre должно быть > 0, получено {K_pre}")
+        return GasMixture(
+            composition={k: v * K_pre for k, v in self.composition.items()},
+            T_K=self.T_K, p_atm=self.p_atm, L_cm=self.L_cm,
+            diluent=dict(self.diluent) if self.diluent else None,
+            profile=self.profile,
+            sources=dict(self.sources) if self.sources else None,
         )
 
 
@@ -167,11 +336,8 @@ class SpectrumGenerator:
         spec = self.instrument.empty_spectrum()
 
         for name, c_ppm in mixture.composition.items():
-            spec.add_molecule(
-                name, c_ppm=c_ppm, L_cm=mixture.L_cm,
-                T_K=mixture.T_K, p_atm=mixture.p_atm,
-                profile=mixture.profile,
-                diluent=mixture.diluent,
+            _add_molecule_multisource(
+                spec, name, c_ppm=c_ppm, mixture=mixture,
             )
 
         if self.instrument.ils is not None:
@@ -193,6 +359,7 @@ class SpectrumGenerator:
             'composition': dict(mixture.composition),
             'T_K': mixture.T_K, 'p_atm': mixture.p_atm,
             'L_cm': mixture.L_cm,
+            'sources': dict(mixture.sources) if mixture.sources else None,
         }
         spec.meta['generator_seed'] = self.seed
         return spec
@@ -331,11 +498,8 @@ class SpectrumGenerator:
         """
         spec = self.instrument.empty_spectrum()
         for name, c_ppm in mixture.composition.items():
-            spec.add_molecule(
-                name, c_ppm=c_ppm, L_cm=mixture.L_cm,
-                T_K=mixture.T_K, p_atm=mixture.p_atm,
-                profile=mixture.profile,
-                diluent=mixture.diluent,
+            _add_molecule_multisource(
+                spec, name, c_ppm=c_ppm, mixture=mixture,
             )
         if self.instrument.ils is not None:
             spec.convolve_ils(self.instrument.ils)
@@ -350,6 +514,7 @@ class SpectrumGenerator:
             'composition': dict(mixture.composition),
             'T_K': mixture.T_K, 'p_atm': mixture.p_atm,
             'L_cm': mixture.L_cm,
+            'sources': dict(mixture.sources) if mixture.sources else None,
         }
         spec.meta['generator_seed'] = self.seed
         return spec
@@ -464,3 +629,41 @@ class SpectrumGenerator:
             'theoretical': theoretical,
             'domain': domain,
         }
+
+
+def _add_molecule_multisource(spec, name, c_ppm, mixture: GasMixture):
+    """
+    Добавить вклад молекулы в спектр, поддерживая несколько источников
+    сечений на одну молекулу.
+
+    Если mixture.sources[name] — список (например, ['mpi', 'hitran_xsc']),
+    Spectrum.add_molecule вызывается по разу на каждый источник с одной и
+    той же c_ppm. Поскольку α_m(λ) из разных баз определены в неперекрывающихся
+    спектральных областях (УФ из MPI vs ИК из HITRAN-xsc), их вклады в
+    τ(λ) = L·Σ_m c_m·α_m складываются без двойного счёта.
+
+    Если значение — строка или sources не задан вовсе, поведение совпадает
+    с прежним «один источник на молекулу».
+    """
+    overrides = mixture.sources or {}
+    raw = overrides.get(name)
+
+    if isinstance(raw, (list, tuple)):
+        # Несколько источников на одну молекулу: явный source= в каждом вызове.
+        for src in raw:
+            spec.add_molecule(
+                name, c_ppm=c_ppm, L_cm=mixture.L_cm,
+                T_K=mixture.T_K, p_atm=mixture.p_atm,
+                profile=mixture.profile,
+                diluent=mixture.diluent,
+                source=src,
+            )
+    else:
+        # Один источник: пусть resolve_source разрешит по overrides/MOLECULE_SOURCE.
+        spec.add_molecule(
+            name, c_ppm=c_ppm, L_cm=mixture.L_cm,
+            T_K=mixture.T_K, p_atm=mixture.p_atm,
+            profile=mixture.profile,
+            diluent=mixture.diluent,
+            sources=overrides,
+        )

@@ -41,7 +41,7 @@ metadata спектра, не влияя на расчёт.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
 import json
 
@@ -73,6 +73,11 @@ class Biomarker:
     wavelength_nm: Optional[float] = None
     source: Optional[str] = None
     notes: Optional[str] = None
+    # Несколько источников сечений на одну молекулу — например,
+    # ['mpi', 'hitran_xsc'] для VOC с УФ- и ИК-полосами. Если задан, sources
+    # имеет приоритет над source. В YAML записывается как список:
+    #   sources: [mpi, hitran_xsc]
+    sources: Optional[List[str]] = None
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'Biomarker':
@@ -106,6 +111,7 @@ class Biomarker:
             c_ppm=c_ppm,
             wavelength_nm=d.get('wavelength_nm'),
             source=d.get('source'),
+            sources=list(d['sources']) if d.get('sources') is not None else None,
             notes=d.get('notes'),
         )
 
@@ -230,8 +236,19 @@ class MixturePanel:
 
         Условия (T, p, L, diluent) берутся из self.conditions.
         Дефолты: T=310 K, p=1 атм, L=10 см, diluent={'air': 1.0}.
+
+        Поле Biomarker.sources (СПИСОК имён баз сечений: 'hitran' / 'pnnl' /
+        'mpi' / 'hitran_xsc') прокидывается в GasMixture.sources как список —
+        для multi-source per molecule (см. api._add_molecule_multisource).
+        Поле Biomarker.source (одиночная строка) — это КЛИНИЧЕСКАЯ ссылка
+        ("Phillips 2003 Table 2") и НЕ интерпретируется как имя базы:
+        одиночные базы пропиши явно через sources=[<база>].
         """
         composition = {b.name: b.c_ppm for b in self.biomarkers}
+        sources: Dict[str, Union[str, List[str]]] = {}
+        for b in self.biomarkers:
+            if b.sources is not None:
+                sources[b.name] = list(b.sources)
         return GasMixture(
             composition=composition,
             T_K=float(self.conditions.get('T_K', 310.0)),
@@ -239,6 +256,7 @@ class MixturePanel:
             L_cm=float(self.conditions.get('L_cm', 10.0)),
             diluent=self.conditions.get('diluent'),
             profile=profile,
+            sources=(sources or None),
         )
 
     def generate(self, generator, profile='voigt'):
@@ -279,6 +297,7 @@ class MixturePanel:
                 c_ppm=b.c_ppm * factor,
                 wavelength_nm=b.wavelength_nm,
                 source=b.source,
+                sources=(list(b.sources) if b.sources is not None else None),
                 notes=b.notes,
             )
             for b in self.biomarkers
